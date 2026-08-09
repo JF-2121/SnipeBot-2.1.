@@ -12,21 +12,17 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
-  MessageFlags,
 } from "discord.js";
 import axios from "axios";
-import { searchAllPlatforms, startVintedOnlyWindow } from "./scrapers/registry.js";
 import { ScrapedItem } from "./scrapers/types.js";
 import { CATEGORIES } from "./config/categories.js";
 import { 
   BRAND_CHANNELS, 
-  getRandomizedInterval,
   getAllBrands 
 } from "./config/brand-channels.js";
 import { logger } from "./lib/logger.js";
 import { vintedScraper } from "./scrapers/vinted.js";
 import { kleinanzeigenScraper } from "./scrapers/kleinanzeigen.js";
-import { COUNTRY_FLAGS } from "./vinted-scraper.js";
 
 interface DealItem extends ScrapedItem {
   currency: string;
@@ -45,11 +41,6 @@ interface DealItem extends ScrapedItem {
   reviewRating?: number;
 }
 
-async function sendDealToMultipleChannels(channels: any[], dealPayload: any): Promise<void> {
-  const targets = (channels || []).slice(0, 3);
-  await Promise.allSettled(targets.map((channel) => channel.send(dealPayload)));
-}
-
 const FALLBACK_CHANNEL_ID = "1483482170583678976";
 const DEFAULT_BRANDS = getAllBrands();
 
@@ -60,19 +51,26 @@ interface CachedDealItem {
 
 const itemCache = new Map<string, CachedDealItem>();
 const MAX_CACHE_SIZE = 2000;
-const CACHE_TTL_MS = 3600000; // 1 hour in milliseconds
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 function cacheItem(item: DealItem) {
+  const canonicalId = String(item.id || item.link || "").trim();
+  if (!canonicalId) return;
+  item.id = canonicalId;
+
   const cached: CachedDealItem = {
     item,
     timestamp: Date.now()
   };
   
-  itemCache.set(item.id, cached);
+  itemCache.set(canonicalId, cached);
+  itemCache.set(encodeURIComponent(canonicalId), cached);
   
-  // LRU eviction: Remove oldest entries if cache exceeds size
+  if (item.url) {
+    itemCache.set(item.url, cached);
+  }
+  
   if (itemCache.size > MAX_CACHE_SIZE) {
-    // Find oldest entry
     let oldestKey: string | null = null;
     let oldestTime = Date.now();
     
@@ -85,28 +83,31 @@ function cacheItem(item: DealItem) {
     
     if (oldestKey) {
       itemCache.delete(oldestKey);
-      logger.debug(`🗑️ LRU eviction: Removed item ${oldestKey} (age: ${Math.floor((Date.now() - oldestTime) / 1000)}s)`);
     }
   }
 }
 
-function getCachedItem(itemId: string): DealItem | null {
-  const cached = itemCache.get(itemId);
-  
-  if (!cached) {
-    return null;
+function getCachedItem(identifier: string): DealItem | null {
+  const normalized = String(identifier || "").trim();
+  if (!normalized) return null;
+
+  const hit = itemCache.get(normalized) || itemCache.get(encodeURIComponent(normalized));
+  if (hit) {
+    if (Date.now() - hit.timestamp > CACHE_TTL_MS) {
+      itemCache.delete(normalized);
+      return null;
+    }
+    return hit.item;
   }
-  
-  const age = Date.now() - cached.timestamp;
-  
-  // Check if item is within 1-hour window
-  if (age > CACHE_TTL_MS) {
-    itemCache.delete(itemId);
-    logger.debug(`⏰ Cache expired: Item ${itemId} (age: ${Math.floor(age / 1000)}s)`);
-    return null;
+
+  for (const [, cached] of itemCache.entries()) {
+    if (cached.item.id === normalized || cached.item.url === normalized) {
+      if (Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
+      return cached.item;
+    }
   }
-  
-  return cached.item;
+
+  return null;
 }
 
 const WHOP_API_KEY = process.env["WHOP_API_KEY"];
@@ -160,76 +161,9 @@ const watchConfig: WatchConfig = {
 const seenItemIds = new Set<string>();
 let rateLimitedUntil = 0;
 let consecutiveRateLimits = 0;
-const postingQueue: Array<{ channel: TextChannel; brand: string; item: DealItem }> = [];
-let postingWorkerRunning = false;
 
-function genderLabel(g: Gender): string {
-  if (g === "herren") return "Herren";
-  if (g === "damen") return "Damen";
-  return "Herren & Damen";
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function runPostingQueueWorker(): Promise<void> {
-  if (postingWorkerRunning) return;
-  postingWorkerRunning = true;
-
-  while (postingWorkerRunning) {
-    const next = postingQueue.shift();
-
-    if (!next) {
-      await delay(250);
-      continue;
-    }
-
-    try {
-      cacheItem(next.item);
-      const mainEmbed = buildDealEmbed(next.item);
-      const images: string[] = (next.item as any).images_array || (next.item as any).photos || [];
-      const embeds = [mainEmbed];
-
-      if (images[1]) embeds.push(new EmbedBuilder().setURL(next.item.url).setImage(images[1]));
-      if (images[2]) embeds.push(new EmbedBuilder().setURL(next.item.url).setImage(images[2]));
-
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId('save_item').setLabel('Merken').setStyle(ButtonStyle.Secondary).setEmoji('💾'),
-        new ButtonBuilder().setCustomId('interested').setLabel('Interessiert').setStyle(ButtonStyle.Primary).setEmoji('⚡'),
-        new ButtonBuilder().setCustomId('fake_check').setLabel('Fake Check').setStyle(ButtonStyle.Secondary).setEmoji('🔎'),
-      );
-
-      await sendDealToMultipleChannels([next.channel], { embeds, components: [row] });
-      logger.info(`📤 ${next.brand}: Posted ${next.item.platform.toUpperCase()} deal - ${((next.item as any).totalPrice ?? next.item.price).toFixed(2)}€`);
-    } catch (err) {
-      logger.error(`❌ Queue post failed for ${next.brand}: ${String(err)}`);
-    }
-
-    await new Promise((res) => setTimeout(res, 5000));
-  }
-}
-
-function enqueueDeal(channel: TextChannel, brand: string, item: DealItem): void {
-  postingQueue.push({ channel, brand, item });
-  void runPostingQueueWorker();
-}
-
-async function findChannelByName(client: Client, channelName: string): Promise<TextChannel | null> {
-  for (const [, guild] of client.guilds.cache) {
-    const ch = guild.channels.cache.find((c) => c.name === channelName && c instanceof TextChannel) as TextChannel | undefined;
-    if (ch) return ch;
-  }
-  return null;
-}
-
-async function getFallbackChannel(client: Client): Promise<TextChannel | null> {
-  try {
-    const ch = await client.channels.fetch(FALLBACK_CHANNEL_ID);
-    if (ch instanceof TextChannel) return ch;
-  } catch { /* ignore */ }
-  return null;
-}
+// Global rotation state for round-robin channel distribution per brand
+const brandChannelIndices: { [brand: string]: number } = {};
 
 function runFakeCheck(item: DealItem): { embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> } {
   const warnings: string[] = [];
@@ -315,8 +249,6 @@ function buildDealEmbed(item: DealItem): EmbedBuilder {
 
   const images = meta.images_array || (meta as any).photos || [];
   const mainImage = images[0] || meta.main_image_url || item.imageUrl || "https://i.imgur.com/8Km9tLL.png";
-  const img2 = images[1];
-  const img3 = images[2];
 
   const safeTitle = meta.cleanTitle || (item as any).cleanTitle || item.title || "—";
 
@@ -333,6 +265,7 @@ function buildDealEmbed(item: DealItem): EmbedBuilder {
   const base = Number(basePrice || 0);
   const fee = total > base ? total - base : 0;
   const priceStr = fee > 0 ? `${base.toFixed(2)} € (+ ${fee.toFixed(2)} €)` : `${base.toFixed(2)} €`;
+
   const mainEmbed = new EmbedBuilder()
     .setColor(0x6EB6FF)
     .setAuthor({ name: sellerName, iconURL: sellerAvatar })
@@ -350,62 +283,65 @@ function buildDealEmbed(item: DealItem): EmbedBuilder {
     .setFooter({ text: `🔗 ${item.brand || "Vinted"}`, iconURL: sellerAvatar })
     .setTimestamp();
 
-  // Return the primary embed; additional embeds (img2/img3) are appended by the caller
   return mainEmbed;
 }
 
 function buildDealButtons(item: DealItem): ActionRowBuilder<ButtonBuilder>[] {
+  const itemId = String(item.id || "").trim();
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId('save_item').setLabel('Merken').setStyle(ButtonStyle.Secondary).setEmoji('💾'),
-    new ButtonBuilder().setCustomId('interested').setLabel('Interessiert').setStyle(ButtonStyle.Primary).setEmoji('⚡'),
-    new ButtonBuilder().setCustomId('fake_check').setLabel('Fake Check').setStyle(ButtonStyle.Secondary).setEmoji('🔎'),
+    new ButtonBuilder().setCustomId(`save_and_check_${itemId}`).setLabel('Merken & Check').setStyle(ButtonStyle.Secondary).setEmoji('💾'),
+    new ButtonBuilder().setCustomId(`interested_${itemId}`).setLabel('Interessiert').setStyle(ButtonStyle.Primary).setEmoji('⚡'),
   );
   return [row];
 }
-
-/**
- * Post deals for a specific brand to its dedicated channel
- * CRITICAL FALLBACK LOGIC: Try Vinted first, if 0 items -> immediately try Kleinanzeigen
- */
 async function postDealsForBrand(client: Client, brandConfig: typeof BRAND_CHANNELS[0]) {
   try {
-    const channel = await client.channels.fetch(brandConfig.channelId).catch(() => null);
-    
-    if (!channel || !(channel instanceof TextChannel)) {
-      logger.warn(`❌ Channel not found for ${brandConfig.brand} (ID: ${brandConfig.channelId})`);
+    const brandChannelIds = String(brandConfig.channelId || "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+
+    const fetchedChannels = await Promise.all(
+      brandChannelIds.map((id) => client.channels.fetch(id).catch(() => null))
+    );
+
+    const targetChannels = fetchedChannels.filter(
+      (ch): ch is TextChannel => ch instanceof TextChannel
+    );
+
+    if (targetChannels.length === 0) {
+      logger.warn(`❌ No valid channels found for brand: ${brandConfig.brand}`);
       return;
     }
 
+    logger.info(`📡 Brand ${brandConfig.brand}: SIMULTANEOUS dispatch across all ${targetChannels.length} dedicated channel(s)`);
     logger.info(`🔍 Searching ${brandConfig.brand}...`);
-    
-    // STEP 1: Try Vinted first (Python subprocess)
+
     let allItems = await vintedScraper.search(brandConfig.query, {
       maxPrice: watchConfig.maxPrice,
     });
-    
+
     logger.info(`📊 Vinted: ${allItems.length} items for ${brandConfig.brand}`);
-    
-    // STEP 2: FALLBACK - If Vinted returns 0 items, immediately try Kleinanzeigen
+
     if (allItems.length === 0) {
       logger.warn(`⚠️ Vinted returned 0 items for ${brandConfig.brand}, triggering Kleinanzeigen fallback...`);
-      
       const kleinItems = await kleinanzeigenScraper.search(brandConfig.query, {
         maxPrice: watchConfig.maxPrice,
       });
-      
       logger.info(`📊 Kleinanzeigen fallback: ${kleinItems.length} items for ${brandConfig.brand}`);
       allItems = kleinItems;
     }
-    
-    if (allItems.length > 0) consecutiveRateLimits = 0;
 
+    if (allItems.length > 0) consecutiveRateLimits = 0;
     logger.info(`✅ ${brandConfig.brand}: ${allItems.length} total items`);
-    let enqueued = 0;
+
     for (const item of allItems) {
-      if (seenItemIds.has(item.id)) continue;
-      seenItemIds.add(item.id);
+      const canonicalId = String(item.id || item.link || "").trim();
+      if (!canonicalId || seenItemIds.has(canonicalId)) continue;
+
       const dealItem: DealItem = {
         ...item,
+        id: canonicalId,
         currency: (item as any).currency || "EUR",
         condition: (item as any).condition || "N/A",
         seller: (item as any).sellerUsername || (item as any).seller || "N/A",
@@ -419,14 +355,47 @@ async function postDealsForBrand(client: Client, brandConfig: typeof BRAND_CHANN
         totalPrice: Number((item as any).totalPrice ?? 0),
         sellerUsername: (item as any).sellerUsername || (item as any).seller || "",
         sellerAvatar: (item as any).sellerAvatar || "",
-        reviewRating: Number((item as any).reviewRating ?? 0),
+        reviewRating: Number((item as any).reviewRating ?? (item as any).sellerRating ?? 0),
       };
-      enqueueDeal(channel, brandConfig.brand, dealItem);
-      enqueued += 1;
+
+      const mainEmbed = buildDealEmbed(dealItem);
+      const images: string[] = (dealItem as any).images_array || (dealItem as any).photos || [];
+      const embeds = [mainEmbed];
+      if (images[1]) embeds.push(new EmbedBuilder().setURL(dealItem.url).setImage(images[1]));
+      if (images[2]) embeds.push(new EmbedBuilder().setURL(dealItem.url).setImage(images[2]));
+
+      const payload = {
+        embeds,
+        components: buildDealButtons(dealItem),
+      };
+
+      // SIMULTANEOUS DISPATCH: Send THIS specific brand's deal to ALL of its configured channels at the same time using Promise.allSettled
+      const dispatchResults = await Promise.allSettled(
+        targetChannels.map(async (channel) => {
+          try {
+            await channel.send(payload);
+            logger.debug(`✅ Posted item ${canonicalId} to channel #${channel.name} (${channel.id}) for brand ${brandConfig.brand}`);
+          } catch (err) {
+            logger.warn(`⚠️ Failed to post to channel ${channel.id}: ${String(err)}`);
+            throw err;
+          }
+        })
+      );
+
+      const successCount = dispatchResults.filter(r => r.status === "fulfilled").length;
+      if (successCount > 0) {
+        seenItemIds.add(canonicalId);
+        cacheItem(dealItem);
+        logger.debug(`✅ Item ${canonicalId} dispatched simultaneously to ${successCount}/${targetChannels.length} channels for brand ${brandConfig.brand}`);
+      } else {
+        logger.warn(`❌ All dispatches failed for item ${canonicalId}`);
+      }
+
+      // Strict 4-second pacing between items
+      await new Promise((resolve) => setTimeout(resolve, 4000));
     }
-    logger.info(`📌 ${brandConfig.brand}: Enqueued ${enqueued} new items`);
-    
-    // Finished processing this brand (no per-brand cooldown here)
+
+    logger.info(`📌 ${brandConfig.brand}: Processing completed`);
   } catch (err) {
     logger.error(`❌ Error searching ${brandConfig.brand}: ${String(err)}`);
   }
@@ -444,19 +413,14 @@ async function postDeals(client: Client) {
 
   logger.info("🚀 Starting deal search with brand-channel system + Kleinanzeigen fallback");
 
-  // DYNAMIC RANDOMIZED CYCLING: Shuffle brands to prevent last brands from waiting too long
   const shuffledBrands = [...BRAND_CHANNELS].sort(() => Math.random() - 0.5);
-  
   logger.info(`🔀 Randomized brand order: ${shuffledBrands.map(b => b.brand).join(", ")}`);
 
-  // Search each brand in its dedicated channel (randomized order)
   for (const brandConfig of shuffledBrands) {
     await postDealsForBrand(client, brandConfig);
-    // Short, fixed delay between brands to avoid WAF/anti-bot triggers
     await new Promise(res => setTimeout(res, 2500));
   }
   
-  // After all brands have been checked, apply a global adaptive cooldown (60-180s)
   const minSec = 60;
   const maxSec = 180;
   const globalDelaySec = Math.floor(Math.random() * (maxSec - minSec + 1)) + minSec;
@@ -536,10 +500,8 @@ export async function startBot() {
 
     logger.info("🚀 Starting continuous brand-channel monitoring with Kleinanzeigen fallback...");
     
-    // Initial search
     await postDeals(client);
     
-    // Continuous monitoring loop
     async function continuousMonitoring() {
       while (watchConfig.active) {
         try {
@@ -548,7 +510,6 @@ export async function startBot() {
           logger.error("Monitoring cycle failed: " + String(err));
         }
         
-        // Minimum 1 minute between full cycles
         const minCycleDelay = 60000;
         await new Promise(resolve => setTimeout(resolve, minCycleDelay));
       }
@@ -571,20 +532,24 @@ export async function startBot() {
         return null;
       };
 
-      // SAVE (old: save_<id>, new: save_item)
-      if (customId.startsWith("save_") || customId === "save_item") {
-        await interaction.deferUpdate();
+      if (customId.startsWith("save_and_check") || customId.startsWith("save_") || customId.startsWith("fakecheck_") || customId === "fake_check") {
+        await interaction.deferReply({ flags: 64 });
+        
         let item: DealItem | null = null;
-        if (customId.startsWith("save_")) {
-          const itemId = customId.replace("save_", "");
-          item = getCachedItem(itemId);
-        } else {
+        const parts = customId.split("_");
+        const possibleId = parts[parts.length - 1];
+
+        if (possibleId && possibleId !== "check" && possibleId !== "item") {
+          item = getCachedItem(possibleId);
+        }
+
+        if (!item) {
           const embedUrl = interaction.message?.embeds?.[0]?.url;
           item = findCachedByUrl(embedUrl);
         }
 
         if (!item) {
-          await interaction.followUp({ content: "❌ Item not in cache or expired (older than 1 hour). Please use a newer deal.", flags: 64 });
+          await interaction.editReply("❌ Item not in cache or expired. Please use a newer deal.");
           return;
         }
 
@@ -603,6 +568,8 @@ export async function startBot() {
           .setTimestamp();
         if (item.imageUrl) savedEmbed.setImage(item.imageUrl);
 
+        const { embed: fakeEmbed, row: fakeRow } = runFakeCheck(item);
+
         const platformName = item.platform === "vinted" ? "Vinted" : "Kleinanzeigen";
         const linkRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder().setLabel(`🛒 View on ${platformName}`).setStyle(ButtonStyle.Link).setURL(item.url),
@@ -615,63 +582,27 @@ export async function startBot() {
             embeds: [savedEmbed],
             components: [linkRow],
           });
-          await interaction.followUp({ content: "✅ Deal saved to your DMs!", flags: 64 });
+          await dm.send({
+            content: `🔍 **Fake-check for your saved deal:**`,
+            embeds: [fakeEmbed],
+            components: [fakeRow],
+          });
+          await interaction.editReply("✅ Deal saved & fake-check sent to your DMs!");
         } catch {
-          await interaction.followUp({
-            content: "⚠️ Your DMs are disabled. Enable DMs to save deals.",
-            flags: 64,
+          await interaction.editReply({
+            content: "⚠️ Your DMs are disabled. Enable DMs to save deals and receive fake-checks.",
           });
         }
         return;
       }
 
-      // INTERESTED
-      if (customId.startsWith("interested_") || customId === "interested") {
+      if (customId.startsWith("interested_")) {
         await interaction.deferUpdate();
         try {
           await interaction.message.react("👍");
           await interaction.followUp({ content: "👍 Marked as interesting!", flags: 64 });
         } catch {
           await interaction.followUp({ content: "❌ Error reacting.", flags: 64 });
-        }
-        return;
-      }
-
-      // FAKE CHECK
-      if (customId.startsWith("fakecheck_") || customId === "fake_check") {
-        await interaction.deferReply({ flags: 64 });
-        let item: DealItem | null = null;
-        if (customId.startsWith("fakecheck_")) {
-          const itemId = customId.replace("fakecheck_", "");
-          item = getCachedItem(itemId);
-        } else {
-          const embedUrl = interaction.message?.embeds?.[0]?.url;
-          item = findCachedByUrl(embedUrl);
-        }
-
-        if (!item) {
-          await interaction.editReply("❌ Item not in cache or expired (older than 1 hour). Please use a newer deal.");
-          return;
-        }
-
-        const { embed, row } = runFakeCheck(item);
-
-        try {
-          const dm = await user.createDM();
-          await dm.send({
-            content: `🔍 **Your fake-check for a deal from the server:**`,
-            embeds: [embed],
-            components: [row],
-          });
-          await interaction.editReply("✅ Fake-check sent to your DMs!");
-        } catch {
-          const fakeChannel = await findChannelByName(client, "fake-check");
-          if (fakeChannel) {
-            await fakeChannel.send({ content: `Fake-check requested by <@${user.id}>:`, embeds: [embed], components: [row] });
-            await interaction.editReply(`✅ Fake-check posted in ${fakeChannel} (DMs disabled).`);
-          } else {
-            await interaction.editReply({ embeds: [embed], components: [row] });
-          }
         }
         return;
       }
