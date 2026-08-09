@@ -1,0 +1,33 @@
+{
+  "name": "snipebot",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Hybrid Node.js/Python Discord bot for Vinted & Kleinanzeigen deal monitoring",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  },
+  "dependencies": {
+    "@discordjs/builders": "^1.14.1",
+    "@discordjs/rest": "^2.6.1",
+    "axios": "^1.18.1",
+    "cheerio": "^1.0.0-rc.12",
+    "discord.js": "^14.26.5",
+    "node-cron": "^4.6.0"
+  },
+  "devDependencies": {
+    "@types/dotenv": "^6.1.1",
+    "@types/node": "^20.19.43",
+    "@types/node-cron": "^3.0.11",
+    "dotenv": "^17.4.2",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "python": ">=3.10.0"
+  },
+  "pythonDependencies": {
+    "aiohttp": "Install via: pip3 install aiohttp"
+  }
+}
