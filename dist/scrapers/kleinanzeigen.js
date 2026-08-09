@@ -142,32 +142,66 @@ async function search(searchText, options = {}) {
                 const id = $item.attr("data-adid") || "";
                 if (!id)
                     return;
-                const title = $item.find(".ellipsis").first().text().trim();
-                if (!title)
+                const rawTitle = $item.find(".ellipsis").first().text().trim();
+                if (!rawTitle)
                     return;
+                // Clean title (remove excessive whitespace/junk)
+                const cleanTitle = rawTitle.replace(/\s+/g, " ").replace(/\|/g, "-").trim();
                 const priceText = $item.find(".aditem-main--middle--price-shipping--price").text().trim();
                 const price = parsePrice(priceText);
                 const dateText = $item.find(".aditem-main--top--right").text().trim();
-                const uploadDate = parseUploadDate(dateText);
+                // Fallback to 'now' when date is missing so items are not excluded
+                const uploadDate = parseUploadDate(dateText) || new Date();
                 const relativeUrl = $item.find("a.ellipsis").attr("href") || "";
                 const link = relativeUrl.startsWith("http") ? relativeUrl : `${KLEINANZEIGEN_BASE}${relativeUrl}`;
-                let imageUrl = $item.find("img.galleryimage-element").attr("src") || "";
-                if (!imageUrl)
-                    imageUrl = $item.find("img").first().attr("src") || "";
-                if (imageUrl && !imageUrl.startsWith("http")) {
-                    imageUrl = imageUrl.startsWith("//") ? `https:${imageUrl}` : `${KLEINANZEIGEN_BASE}${imageUrl}`;
+                // Extract up to 3 images from the listing preview
+                const images = [];
+                $item.find("img").each((_, imgEl) => {
+                    if (images.length >= 3)
+                        return;
+                    let src = $(imgEl).attr("data-src") || $(imgEl).attr("src") || "";
+                    if (!src)
+                        return;
+                    if (!src.startsWith("http")) {
+                        src = src.startsWith("//") ? `https:${src}` : `${KLEINANZEIGEN_BASE}${src}`;
+                    }
+                    if (!images.includes(src))
+                        images.push(src);
+                });
+                // Ensure at least one main image
+                let mainImage = images[0] || "";
+                if (!mainImage) {
+                    mainImage = "https://i.imgur.com/8Km9tLL.png"; // generic placeholder avatar/image
                 }
-                const brand = extractBrand(title, searchText);
-                const size = extractSize(title);
+                const brand = extractBrand(cleanTitle, searchText);
+                const size = extractSize(cleanTitle);
+                // Seller information (listing preview doesn't always include seller) - provide safe fallbacks
+                const sellerUsername = $item.find(".seller-name, .user-name").first().text().trim() || "Kleinanzeigen Verkäufer";
+                const sellerAvatar = $item.find("img.user-avatar").attr("src") || sellerUsername ? "https://i.imgur.com/8Km9tLL.png" : "https://i.imgur.com/8Km9tLL.png";
+                const condition = $item.find(".condition, .aditem-attributes").first().text().trim() || "—";
+                const shortDescription = $item.find(".aditem-main--middle--description").text().trim() || "Keine Beschreibung";
+                // Compose totalPrice (Kleinanzeigen: no protection fee assumed)
+                const totalPrice = Number(price || 0);
                 const item = {
                     id,
-                    title,
+                    title: cleanTitle,
                     price,
                     size,
                     brand,
                     link,
-                    imageUrl,
+                    imageUrl: mainImage,
                     platform: "kleinanzeigen",
+                    // Extended fields to match Vinted's updated structure
+                    cleanTitle,
+                    sellerUsername: sellerUsername || "Kleinanzeigen Verkäufer",
+                    sellerAvatar: sellerAvatar || "https://i.imgur.com/8Km9tLL.png",
+                    condition: condition || "—",
+                    publishedAt: uploadDate ? (uploadDate instanceof Date ? (uploadDate.toDateString() === new Date().toDateString() ? "Gerade eben" : uploadDate.toLocaleDateString("de-DE")) : String(uploadDate)) : "Gerade eben",
+                    description: shortDescription,
+                    images_array: images,
+                    main_image_url: mainImage,
+                    totalPrice: totalPrice,
+                    buyerProtectionFee: 0,
                 };
                 if (isQualityDeal(item, searchText, uploadDate)) {
                     items.push(item);

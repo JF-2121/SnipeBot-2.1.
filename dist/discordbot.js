@@ -1,11 +1,14 @@
 import { Client, GatewayIntentBits, EmbedBuilder, TextChannel, Events, ActivityType, SlashCommandBuilder, REST, Routes, ButtonBuilder, ButtonStyle, ActionRowBuilder, } from "discord.js";
 import axios from "axios";
 import { CATEGORIES } from "./config/categories.js";
-import { BRAND_CHANNELS, getRandomizedInterval, getAllBrands } from "./config/brand-channels.js";
+import { BRAND_CHANNELS, getAllBrands } from "./config/brand-channels.js";
 import { logger } from "./lib/logger.js";
 import { vintedScraper } from "./scrapers/vinted.js";
 import { kleinanzeigenScraper } from "./scrapers/kleinanzeigen.js";
-import { COUNTRY_FLAGS } from "./vinted-scraper.js";
+async function sendDealToMultipleChannels(channels, dealPayload) {
+    const targets = (channels || []).slice(0, 3);
+    await Promise.allSettled(targets.map((channel) => channel.send(dealPayload)));
+}
 const FALLBACK_CHANNEL_ID = "1483482170583678976";
 const DEFAULT_BRANDS = getAllBrands();
 const itemCache = new Map();
@@ -88,12 +91,50 @@ const watchConfig = {
 const seenItemIds = new Set();
 let rateLimitedUntil = 0;
 let consecutiveRateLimits = 0;
+const postingQueue = [];
+let postingWorkerRunning = false;
 function genderLabel(g) {
     if (g === "herren")
         return "Herren";
     if (g === "damen")
         return "Damen";
     return "Herren & Damen";
+}
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function runPostingQueueWorker() {
+    if (postingWorkerRunning)
+        return;
+    postingWorkerRunning = true;
+    while (postingWorkerRunning) {
+        const next = postingQueue.shift();
+        if (!next) {
+            await delay(250);
+            continue;
+        }
+        try {
+            cacheItem(next.item);
+            const mainEmbed = buildDealEmbed(next.item);
+            const images = next.item.images_array || next.item.photos || [];
+            const embeds = [mainEmbed];
+            if (images[1])
+                embeds.push(new EmbedBuilder().setURL(next.item.url).setImage(images[1]));
+            if (images[2])
+                embeds.push(new EmbedBuilder().setURL(next.item.url).setImage(images[2]));
+            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('save_item').setLabel('Merken').setStyle(ButtonStyle.Secondary).setEmoji('💾'), new ButtonBuilder().setCustomId('interested').setLabel('Interessiert').setStyle(ButtonStyle.Primary).setEmoji('⚡'), new ButtonBuilder().setCustomId('fake_check').setLabel('Fake Check').setStyle(ButtonStyle.Secondary).setEmoji('🔎'));
+            await sendDealToMultipleChannels([next.channel], { embeds, components: [row] });
+            logger.info(`📤 ${next.brand}: Posted ${next.item.platform.toUpperCase()} deal - ${(next.item.totalPrice ?? next.item.price).toFixed(2)}€`);
+        }
+        catch (err) {
+            logger.error(`❌ Queue post failed for ${next.brand}: ${String(err)}`);
+        }
+        await new Promise((res) => setTimeout(res, 5000));
+    }
+}
+function enqueueDeal(channel, brand, item) {
+    postingQueue.push({ channel, brand, item });
+    void runPostingQueueWorker();
 }
 async function findChannelByName(client, channelName) {
     for (const [, guild] of client.guilds.cache) {
@@ -195,122 +236,45 @@ function runFakeCheck(item) {
     const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🔗 Inserat öffnen").setStyle(ButtonStyle.Link).setURL(item.url));
     return { embed, row };
 }
+function ratingToStars(rating, count) {
+    const r = Math.max(0, Math.min(5, Math.round(rating ?? 0)));
+    const stars = r > 0 ? "⭐️".repeat(r) : "";
+    const cnt = count ?? 0;
+    return stars ? `${stars} (${cnt})` : `(0)`;
+}
 function buildDealEmbed(item) {
-    // Extract all metadata - NO validation, just display what we have
-    const countryTitle = item.countryTitle || "Germany";
-    const condition = item.condition || "N/A";
-    const photos = item.photos || [];
-    const publishedAt = item.publishedAt || "";
-    const reviewCount = item.reviewCount || 0;
-    // SIZE: Always show, even if N/A
-    const size = item.size || "N/A";
-    // CONDITION: Always show, even if N/A
-    const conditionDisplay = condition;
-    // REVIEWS: Always show
-    const reviewsDisplay = reviewCount > 0 ? `⭐ ${reviewCount}` : "N/A";
-    // PUBLISHED: Parse timestamp or show N/A
-    let published = "N/A";
-    if (publishedAt && publishedAt !== "") {
-        try {
-            // Try parsing as Unix timestamp first
-            const timestamp = parseInt(publishedAt) * 1000;
-            if (!isNaN(timestamp) && timestamp > 0) {
-                const now = Date.now();
-                const diff = Math.floor((now - timestamp) / 1000);
-                if (diff < 60)
-                    published = "vor wenigen Sekunden";
-                else if (diff < 3600)
-                    published = `vor ${Math.floor(diff / 60)} Min.`;
-                else if (diff < 86400)
-                    published = `vor ${Math.floor(diff / 3600)} Std.`;
-                else if (diff < 604800)
-                    published = `vor ${Math.floor(diff / 86400)} Tagen`;
-                else if (diff < 2592000)
-                    published = `vor ${Math.floor(diff / 604800)} Wochen`;
-                else
-                    published = `vor ${Math.floor(diff / 2592000)} Monaten`;
-            }
-            else {
-                // If not a timestamp, use the raw string (e.g., "vor 2 Stunden")
-                published = publishedAt;
-            }
-        }
-        catch (e) {
-            // If parsing fails, use raw string
-            published = publishedAt || "N/A";
-        }
-    }
-    // BRAND: Always show
-    const brand = item.brand || "Unknown";
-    // Calculate buyer protection fee (5% + 0.70€)
-    const protectionFee = item.price * 0.05 + 0.70;
-    const totalPrice = item.price + protectionFee;
-    // Get country flag
-    const countryFlag = COUNTRY_FLAGS[countryTitle] || "🌍";
-    // TITLE: [Flag] [First 5 words] | [Total Price] €
-    const titleWords = item.title.split(/\s+/).slice(0, 5).join(" ");
-    const title = `${countryFlag} ${titleWords} | ${totalPrice.toFixed(2)} €`;
-    // Brand color: 0x6EB6FF
-    const color = 0x6EB6FF;
-    // Price breakdown
-    const priceBreakdown = `${item.price.toFixed(2)} € (+ ${protectionFee.toFixed(2)} €)`;
-    const embed = new EmbedBuilder()
-        .setColor(color)
-        .setTitle(title.slice(0, 256))
+    const meta = item;
+    const images = meta.images_array || meta.photos || [];
+    const mainImage = images[0] || meta.main_image_url || item.imageUrl || "https://i.imgur.com/8Km9tLL.png";
+    const img2 = images[1];
+    const img3 = images[2];
+    const safeTitle = meta.cleanTitle || item.cleanTitle || item.title || "—";
+    const basePrice = Number(meta.base_price ?? item.price ?? 0);
+    const buyerFee = Number(meta.buyerProtectionFee ?? meta.protection_fee ?? 0);
+    const totalPrice = Number(meta.totalPrice ?? item.totalPrice ?? (basePrice + buyerFee));
+    const reviewsDisplay = ratingToStars(meta.reviewRating, meta.reviewCount);
+    const published = meta.publishedAt || item.publishedAt || "Gerade eben";
+    const sellerName = (meta.sellerUsername || item.sellerUsername || item.seller || "—").toString();
+    const sellerAvatar = (meta.sellerAvatar || item.sellerAvatar || "").toString() || undefined;
+    const total = Number(totalPrice || 0);
+    const base = Number(basePrice || 0);
+    const fee = total > base ? total - base : 0;
+    const priceStr = fee > 0 ? `${base.toFixed(2)} € (+ ${fee.toFixed(2)} €)` : `${base.toFixed(2)} €`;
+    const mainEmbed = new EmbedBuilder()
+        .setColor(0x6EB6FF)
+        .setAuthor({ name: sellerName, iconURL: sellerAvatar })
+        .setTitle(`${safeTitle} | ${Number(total || base).toFixed(2)} €`.slice(0, 256))
         .setURL(item.url)
-        .addFields({ name: "🏷️ Brand", value: brand, inline: true }, { name: "📏 Size", value: size, inline: true }, { name: "✨ Condition", value: conditionDisplay, inline: true }, { name: "⏰ Published", value: published, inline: true }, { name: "⭐️ Reviews", value: reviewsDisplay, inline: true }, { name: "💶 Price", value: priceBreakdown, inline: true })
-        .setFooter({ text: "Vinted Sniper •" })
+        .addFields({ name: "🏷️ Brand", value: (meta.brand || item.brand || "—") || "—", inline: true }, { name: "📏 Size", value: (meta.size || item.size || "—") || "—", inline: true }, { name: "✨ Condition", value: (meta.condition || item.condition || "—") || "—", inline: true }, { name: "⏰ Published", value: published || "—", inline: true }, { name: "🌟 Reviews", value: reviewsDisplay || "—", inline: true }, { name: "💰 Price", value: priceStr || "—", inline: true })
+        .setImage(mainImage)
+        .setFooter({ text: `🔗 ${item.brand || "Vinted"}`, iconURL: sellerAvatar })
         .setTimestamp();
-    // Use photos with fallback - always try to show an image
-    if (photos.length > 0) {
-        embed.setImage(photos[0]);
-    }
-    else if (item.imageUrl) {
-        embed.setImage(item.imageUrl);
-    }
-    return embed;
+    // Return the primary embed; additional embeds (img2/img3) are appended by the caller
+    return mainEmbed;
 }
 function buildDealButtons(item) {
-    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`save_${item.id}`).setLabel("💾 Merken").setStyle(ButtonStyle.Secondary), new ButtonBuilder().setCustomId(`interested_${item.id}`).setLabel("⚡ Interessiert").setStyle(ButtonStyle.Primary), new ButtonBuilder().setCustomId(`fakecheck_${item.id}`).setLabel("🔍 Fake Check").setStyle(ButtonStyle.Secondary));
+    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('save_item').setLabel('Merken').setStyle(ButtonStyle.Secondary).setEmoji('💾'), new ButtonBuilder().setCustomId('interested').setLabel('Interessiert').setStyle(ButtonStyle.Primary).setEmoji('⚡'), new ButtonBuilder().setCustomId('fake_check').setLabel('Fake Check').setStyle(ButtonStyle.Secondary).setEmoji('🔎'));
     return [row];
-}
-/**
- * Calculate composite deal-score for a listing.
- * Higher score = better deal.
- * Based on the scoring algorithm from TestArchitecture/snipebot.py
- */
-function calculateDealScore(item) {
-    if (!item.price || item.price <= 0)
-        return 0;
-    let score = 0;
-    // Price Discount: Lower price = higher points
-    if (item.price < 15) {
-        score += 30;
-    }
-    else if (item.price < 30) {
-        score += 15;
-    }
-    // Keyword Bonuses: High-value keywords get +20 points each
-    const highValueKeywords = [
-        "vintage", "heavyweight", "spellout", "box logo", "gore-tex",
-        "y2k", "deadstock", "made in usa", "fleece", "nuptse", "big logo",
-        "archive", "rare", "limited", "og", "original"
-    ];
-    const titleLower = item.title.toLowerCase();
-    for (const keyword of highValueKeywords) {
-        if (titleLower.includes(keyword)) {
-            score += 20;
-        }
-    }
-    // Size Bonus: Preferred sizes (M, L, XL) get +10 points
-    const preferredSizes = ["m", "l", "xl", "medium", "large"];
-    const sizeLower = (item.size || "").toLowerCase();
-    if (preferredSizes.some(size => sizeLower === size || sizeLower.includes(size))) {
-        score += 10;
-    }
-    // Base score: cheaper items get exponentially higher scores
-    score += 1000.0 / item.price;
-    return score;
 }
 /**
  * Post deals for a specific brand to its dedicated channel
@@ -338,48 +302,36 @@ async function postDealsForBrand(client, brandConfig) {
             logger.info(`📊 Kleinanzeigen fallback: ${kleinItems.length} items for ${brandConfig.brand}`);
             allItems = kleinItems;
         }
-        if (allItems.length > 0) {
+        if (allItems.length > 0)
             consecutiveRateLimits = 0;
-        }
         logger.info(`✅ ${brandConfig.brand}: ${allItems.length} total items`);
-        const newItems = allItems.filter((i) => !seenItemIds.has(i.id));
-        logger.info(`📌 ${brandConfig.brand}: ${newItems.length} new items`);
-        // SCORING & THROTTLING: Calculate scores and sort by deal quality
-        const scoredItems = newItems.map(item => ({
-            item,
-            score: calculateDealScore(item)
-        }));
-        // Sort by score DESC (best deals first)
-        scoredItems.sort((a, b) => b.score - a.score);
-        // Throttle: Only post TOP 5 highest-scoring items per brand per cycle
-        const topItems = scoredItems.slice(0, 5);
-        const suppressedCount = newItems.length - topItems.length;
-        if (suppressedCount > 0) {
-            logger.info(`🔇 ${brandConfig.brand}: Suppressed ${suppressedCount} lower-scoring items to prevent spam`);
-        }
-        // Post top-scoring deals
-        for (const { item, score } of topItems) {
+        let enqueued = 0;
+        for (const item of allItems) {
+            if (seenItemIds.has(item.id))
+                continue;
             seenItemIds.add(item.id);
             const dealItem = {
                 ...item,
-                currency: "EUR",
-                condition: "—",
-                seller: "—",
+                currency: item.currency || "EUR",
+                condition: item.condition || "N/A",
+                seller: item.sellerUsername || item.seller || "N/A",
                 location: "—",
                 url: item.link,
+                description: item.description || "",
+                main_image_url: item.main_image_url || item.imageUrl,
+                buyerProtectionFee: Number(item.buyerProtectionFee ?? 0),
+                shippingFee: Number(item.shippingFee ?? 0),
+                feeTotal: Number(item.feeTotal ?? 0),
+                totalPrice: Number(item.totalPrice ?? 0),
+                sellerUsername: item.sellerUsername || item.seller || "",
+                sellerAvatar: item.sellerAvatar || "",
+                reviewRating: Number(item.reviewRating ?? 0),
             };
-            cacheItem(dealItem);
-            const embed = buildDealEmbed(dealItem);
-            const rows = buildDealButtons(dealItem);
-            await channel.send({ embeds: [embed], components: rows });
-            logger.info(`📤 ${brandConfig.brand}: Posted ${item.platform.toUpperCase()} deal - ${item.price}€ (Score: ${score.toFixed(1)})`);
-            await new Promise((r) => setTimeout(r, 300));
+            enqueueDeal(channel, brandConfig.brand, dealItem);
+            enqueued += 1;
         }
-        // Adaptive interval with jitter
-        const baseInterval = brandConfig.refreshInterval * 1000;
-        const randomizedInterval = getRandomizedInterval(baseInterval);
-        logger.info(`⏱️ ${brandConfig.brand}: Next check in ${randomizedInterval / 1000}s`);
-        await new Promise((r) => setTimeout(r, randomizedInterval));
+        logger.info(`📌 ${brandConfig.brand}: Enqueued ${enqueued} new items`);
+        // Finished processing this brand (no per-brand cooldown here)
     }
     catch (err) {
         logger.error(`❌ Error searching ${brandConfig.brand}: ${String(err)}`);
@@ -400,7 +352,15 @@ async function postDeals(client) {
     // Search each brand in its dedicated channel (randomized order)
     for (const brandConfig of shuffledBrands) {
         await postDealsForBrand(client, brandConfig);
+        // Short, fixed delay between brands to avoid WAF/anti-bot triggers
+        await new Promise(res => setTimeout(res, 2500));
     }
+    // After all brands have been checked, apply a global adaptive cooldown (60-180s)
+    const minSec = 60;
+    const maxSec = 180;
+    const globalDelaySec = Math.floor(Math.random() * (maxSec - minSec + 1)) + minSec;
+    logger.info(`⏱️ Full cycle completed. Next full cycle in ${globalDelaySec}s`);
+    await new Promise(res => setTimeout(res, globalDelaySec * 1000));
     logger.info("✅ Deal search cycle completed");
 }
 const commands = [
@@ -485,19 +445,37 @@ export async function startBot() {
     client.on(Events.InteractionCreate, async (interaction) => {
         if (interaction.isButton()) {
             const { customId, user } = interaction;
-            if (customId.startsWith("save_")) {
+            const findCachedByUrl = (url) => {
+                if (!url)
+                    return null;
+                for (const [, cached] of itemCache) {
+                    if (cached.item.url === url)
+                        return cached.item;
+                }
+                return null;
+            };
+            // SAVE (old: save_<id>, new: save_item)
+            if (customId.startsWith("save_") || customId === "save_item") {
                 await interaction.deferUpdate();
-                const itemId = customId.replace("save_", "");
-                const item = getCachedItem(itemId);
+                let item = null;
+                if (customId.startsWith("save_")) {
+                    const itemId = customId.replace("save_", "");
+                    item = getCachedItem(itemId);
+                }
+                else {
+                    const embedUrl = interaction.message?.embeds?.[0]?.url;
+                    item = findCachedByUrl(embedUrl);
+                }
                 if (!item) {
                     await interaction.followUp({ content: "❌ Item not in cache or expired (older than 1 hour). Please use a newer deal.", flags: 64 });
                     return;
                 }
+                const priceVal = Number(item.totalPrice ?? item.base_price ?? item.price ?? 0);
                 const savedEmbed = new EmbedBuilder()
                     .setColor(0xe91e63)
                     .setTitle(`❤️ Saved Deal: ${item.brand || ""} | ${item.title}`.slice(0, 250))
                     .setURL(item.url)
-                    .addFields({ name: "💰 Price", value: `**${item.price.toFixed(2)} ${item.currency}**`, inline: true }, { name: "📐 Size", value: item.size || "—", inline: true }, { name: "✨ Condition", value: item.condition || "—", inline: true }, { name: "👤 Seller", value: item.seller || "—", inline: true })
+                    .addFields({ name: "💰 Price", value: `**${priceVal.toFixed(2)} EUR**`, inline: true }, { name: "📐 Size", value: item.size || "—", inline: true }, { name: "✨ Condition", value: item.condition || "—", inline: true }, { name: "👤 Seller", value: item.seller || "—", inline: true })
                     .setFooter({ text: "Your saved deals • Snipebot" })
                     .setTimestamp();
                 if (item.imageUrl)
@@ -521,7 +499,8 @@ export async function startBot() {
                 }
                 return;
             }
-            if (customId.startsWith("interested_")) {
+            // INTERESTED
+            if (customId.startsWith("interested_") || customId === "interested") {
                 await interaction.deferUpdate();
                 try {
                     await interaction.message.react("👍");
@@ -532,10 +511,18 @@ export async function startBot() {
                 }
                 return;
             }
-            if (customId.startsWith("fakecheck_")) {
+            // FAKE CHECK
+            if (customId.startsWith("fakecheck_") || customId === "fake_check") {
                 await interaction.deferReply({ flags: 64 });
-                const itemId = customId.replace("fakecheck_", "");
-                const item = getCachedItem(itemId);
+                let item = null;
+                if (customId.startsWith("fakecheck_")) {
+                    const itemId = customId.replace("fakecheck_", "");
+                    item = getCachedItem(itemId);
+                }
+                else {
+                    const embedUrl = interaction.message?.embeds?.[0]?.url;
+                    item = findCachedByUrl(embedUrl);
+                }
                 if (!item) {
                     await interaction.editReply("❌ Item not in cache or expired (older than 1 hour). Please use a newer deal.");
                     return;

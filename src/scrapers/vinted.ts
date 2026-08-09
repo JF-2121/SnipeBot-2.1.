@@ -62,6 +62,28 @@ async function search(searchText: string, options: SearchOptions = {}): Promise<
   }
 }
 
+function mapVintedItemToListing(data: any): ScrapedItem {
+  const sellerUsername = (data.sellerUsername || data.seller || data.user?.login || "Unknown Seller").toString();
+  const sellerAvatar = (data.sellerAvatar || data.user?.photo?.url || data.user?.avatar_url || "").toString();
+
+  return {
+    id: (data.id || data.itemId || data.slug || `${Date.now()}-${Math.random()}`).toString(),
+    title: (data.title || data.name || "").toString(),
+    price: Number(data.price ?? data.base_price ?? 0),
+    imageUrl: (data.imageUrl || data.main_image_url || data.photo?.url || "").toString(),
+    link: (data.link || data.url || "").toString(),
+    platform: "vinted",
+    brand: (data.brand || data.brand_title || "").toString(),
+    size: (data.size || data.size_title || "").toString(),
+    condition: (data.condition || data.status || "").toString(),
+    description: (data.description || data.desc || "").toString(),
+    sellerUsername,
+    sellerAvatar,
+    seller: sellerUsername,
+    ...data,
+  } as ScrapedItem;
+}
+
 export const vintedScraper: Scraper = {
   name: "vinted",
   search,

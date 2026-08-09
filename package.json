@@ -4,9 +4,9 @@
   "type": "module",
   "description": "Hybrid Node.js/Python Discord bot for Vinted & Kleinanzeigen deal monitoring",
   "scripts": {
-    "build": "tsc",
+    "build": "node ./node_modules/typescript/lib/tsc.js",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js"
+    "dev": "node ./node_modules/typescript/lib/tsc.js && node dist/index.js"
   },
   "dependencies": {
     "@discordjs/builders": "^1.14.1",
