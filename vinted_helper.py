@@ -184,42 +184,47 @@ def _parse_json_listing(item_data, listing_id, search_text):
     photos = _extract_first_photo_urls(item_data)
     image_url = photos[0] if photos else ""
 
+    # NOTE: _first_non_empty's own empty-string check means a trailing "" fallback is
+    # silently discarded (it never "wins"), so a genuine miss returns None here — always
+    # coalesce with `or ""` below rather than relying on a fallback arg, otherwise str(None)
+    # produces the literal text "None" in the posted embed.
+    seller_id = user_obj.get("id")
+    seller_profile_url = str(_first_non_empty(user_obj.get("profile_url"), user_obj.get("share_profile_url")) or "")
     seller_username = str(
         _first_non_empty(
             user_obj.get("login"),
             user_obj.get("username"),
             user_obj.get("name"),
-            "",
-        )
+        ) or ""
     )
     user_photo = user_obj.get("photo")
     seller_avatar = ""
     if isinstance(user_photo, dict):
         seller_avatar = str(
-            _first_non_empty(
-                user_photo.get("url"),
-                user_photo.get("full_size_url"),
-                "",
-            )
+            _first_non_empty(user_photo.get("url"), user_photo.get("full_size_url")) or ""
         )
     else:
-        seller_avatar = str(_first_non_empty(user_obj.get("avatar_url"), user_obj.get("photo_url"), ""))
+        seller_avatar = str(
+            _first_non_empty(user_obj.get("avatar_url"), user_obj.get("photo_url")) or ""
+        )
 
-    review_count_raw = _first_non_empty(
-        user_obj.get("positive_feedback_count"),
-        user_obj.get("feedback_count"),
-        user_obj.get("reviews_count"),
-        0,
-    )
-    review_count = int(_to_float(review_count_raw) or 0)
-    review_rating = _to_float(user_obj.get("feedback_reputation"))
+    # The catalog search endpoint's `user` object does NOT include feedback/rating data
+    # (only id/login/photo/business) — real review count + star rating are fetched
+    # separately in main() via /api/v2/users/{id}, bounded to the freshest few items so
+    # we don't add a per-item network round trip to every single search result.
+    review_count = 0
+    review_rating = None
 
-    published_at = _first_non_empty(
-        item_data.get("created_at_ts"),
-        item_data.get("photo_updated_at"),
-        item_data.get("created_at"),
-        "",
-    )
+    # The catalog search endpoint has no created_at/created_at_ts field on the item at all
+    # (verified against a live response) — the item's OWN photo upload timestamp is the
+    # closest real proxy for when the listing was published, so use that instead of the
+    # nonexistent fields the previous version looked for (which silently always missed).
+    item_photo = item_data.get("photo")
+    published_at_ts = None
+    if isinstance(item_photo, dict):
+        high_res = item_photo.get("high_resolution")
+        if isinstance(high_res, dict):
+            published_at_ts = _to_float(high_res.get("timestamp"))
 
     condition = str(
         _first_non_empty(
@@ -269,10 +274,12 @@ def _parse_json_listing(item_data, listing_id, search_text):
         "photos": photos,
         "images_array": images_array,
         "condition": condition,
-        "publishedAt": str(published_at or ""),
+        "publishedAtTs": int(published_at_ts) if published_at_ts is not None else None,
         "countryTitle": country_title,
         "reviewCount": review_count,
-        "reviewRating": float(review_rating) if review_rating is not None else None,
+        "reviewRating": review_rating,
+        "sellerId": seller_id,
+        "sellerProfileUrl": seller_profile_url,
         "sellerUsername": seller_username,
         "sellerAvatar": seller_avatar,
         "platform": "vinted",
@@ -428,154 +435,202 @@ def parse_listings(html_text: str, search_text: str):
 
     return listings
 
+# Only enrich the freshest few listings with real seller rating + country — the catalog
+# search endpoint doesn't include either, so it costs one extra request per seller. Bounding
+# this keeps search latency predictable instead of doing it for every single result, most of
+# which are duplicates the bot has already seen and won't actually post.
+SELLER_RATING_LOOKUP_LIMIT = 8
+
+async def _enrich_seller_ratings(session, api_headers, listings):
+    targets = [listing for listing in listings[:SELLER_RATING_LOOKUP_LIMIT] if listing.get("sellerId")]
+    if not targets:
+        return
+
+    async def fetch_one(listing):
+        try:
+            async with session.get(
+                f"https://www.vinted.de/api/v2/users/{listing['sellerId']}",
+                headers=api_headers,
+            ) as ures:
+                if ures.status != 200:
+                    return
+                udata = json.loads(await ures.text())
+                user = udata.get("user", {}) if isinstance(udata, dict) else {}
+                feedback_count = user.get("feedback_count")
+                feedback_reputation = user.get("feedback_reputation")
+                if feedback_count is not None:
+                    listing["reviewCount"] = int(feedback_count)
+                if feedback_reputation is not None:
+                    # feedback_reputation is a 0-1 score (verified live, e.g. 0.98 -> ~4.9 stars)
+                    listing["reviewRating"] = round(float(feedback_reputation) * 5, 2)
+                country_code = user.get("country_iso_code")
+                if country_code:
+                    listing["sellerCountryCode"] = str(country_code).upper()
+        except Exception:
+            pass  # a single seller lookup failing must not break the whole search
+
+    await asyncio.gather(*(fetch_one(listing) for listing in targets))
+
+HOMEPAGE_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+
+async def bootstrap_session(session: aiohttp.ClientSession) -> bool:
+    """
+    Visits the Vinted homepage and waits for a valid session cookie, retrying with a
+    1s backoff. Returns True once a real session is established, False if it never
+    got one. Shared by the one-shot CLI path (main, below) and the persistent daemon
+    (vinted_daemon.py) so both use the exact same tested bootstrap logic.
+    """
+    homepage_headers = {
+        "User-Agent": HOMEPAGE_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Ch-Ua": '"Chromium";v="122", "Google Chrome";v="122", ";Not A Brand";v="99"',
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.vinted.de/",
+    }
+
+    max_retries = 6
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with session.get("https://www.vinted.de/", headers=homepage_headers, allow_redirects=True) as home_res:
+                await home_res.text()
+                cookie_snapshot = {c.key: c.value for c in session.cookie_jar}
+                if any(k in ["access_token_web", "anon_id", "v_udt"] for k in cookie_snapshot.keys()):
+                    return True
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+    return False
+
+
+def _build_api_headers(session: aiohttp.ClientSession) -> dict:
+    cookie_snapshot = {c.key: c.value for c in session.cookie_jar}
+    headers = {
+        "User-Agent": HOMEPAGE_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Ch-Ua": '"Chromium";v="122", "Google Chrome";v="122", ";Not A Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Referer": "https://www.vinted.de/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    cookie_header = "; ".join([f"{k}={v}" for k, v in cookie_snapshot.items()])
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return headers
+
+
+async def fetch_catalog(session: aiohttp.ClientSession, search_text: str, max_price=None) -> dict:
+    """
+    Runs one catalog search using an ALREADY-bootstrapped session (does not itself visit
+    the homepage or acquire cookies — call bootstrap_session first). Returns the same
+    {"success": bool, "items"/"error": ...} shape the Node side already expects.
+    """
+    api_headers = _build_api_headers(session)
+    params_api = {"search_text": search_text, "order": "newest_first"}
+    if max_price and max_price > 0:
+        params_api["price_to"] = str(int(max_price))
+
+    try:
+        async with session.get("https://www.vinted.de/api/v2/catalog/items", headers=api_headers, params=params_api) as api_res:
+            status = api_res.status
+            text = await api_res.text()
+
+            if status != 200:
+                snippet = text[:500].replace("\n", " ")
+                return {"success": False, "error": "API_HTTP_ERROR", "status": status, "body_snippet": snippet}
+
+            try:
+                data = json.loads(text)
+            except Exception as e_json:
+                snippet = text[:500].replace("\n", " ")
+                return {"success": False, "error": "API_JSON_DECODE", "exception": str(e_json), "body_snippet": snippet}
+
+            catalog_items = []
+            _collect_catalog_items(data, catalog_items)
+
+            listings = []
+            for item_data in catalog_items:
+                item_id = str(item_data.get('id', ''))
+                if not item_id:
+                    continue
+                parsed = _parse_json_listing(item_data, item_id, search_text)
+                if parsed.get("totalPrice") is None:
+                    parsed["totalPrice"] = parsed.get("base_price") or parsed.get("price") or 0.0
+                if parsed.get("price") is None:
+                    parsed["price"] = parsed.get("base_price") or parsed.get("totalPrice") or 0.0
+                if parsed.get('price') and float(parsed.get('price')) > 0:
+                    listings.append(parsed)
+
+            if not listings:
+                snippet = json.dumps(data)[:500].replace("\n", " ")
+                return {"success": False, "error": "API_NO_ITEMS", "body_snippet": snippet}
+
+            if max_price and max_price > 0:
+                listings = [it for it in listings if it.get('price', 0) > 0 and it['price'] <= max_price]
+            # NOTE: seller enrichment (rating + country) is intentionally NOT done here anymore.
+            # It used to blindly cover the top 8 raw search results, but most of those are
+            # duplicates the bot has already seen — the daemon now enriches only the items that
+            # actually survive dedup in Node (see enrich_seller in vinted_daemon.py), which is both
+            # faster (no wasted lookups) and gives 100% coverage of what's actually posted instead
+            # of a partial, position-dependent subset. The one-shot CLI fallback below still does
+            # its own best-effort top-N enrichment since it has no such post-dedup callback.
+            return {"success": True, "items": listings}
+
+    except Exception as e_api:
+        return {"success": False, "error": "API_REQUEST_FAILED", "exception": str(e_api)}
+
+
 async def main():
-    """Main entry point for subprocess calls from Node.js"""
+    """One-shot CLI entry point — kept as a fallback path Node can use if the persistent
+    daemon (vinted_daemon.py) fails to start, so there's always a known-working mode."""
     if len(sys.argv) < 2:
         result = {"success": False, "error": "Usage: vinted_helper.py <search_text> [max_price]", "items": []}
         print(json.dumps(result), flush=True)
         sys.exit(1)
-    
+
     search_text = sys.argv[1]
     max_price = None
-    
     if len(sys.argv) > 2:
         try:
             max_price = float(sys.argv[2])
         except ValueError:
             pass
-    
-    params = {
-        "search_text": search_text,
-        "order": "newest_first",
-    }
-    if max_price and max_price > 0:
-        params["price_to"] = str(int(max_price))
-    
-    url = f"{VINTED_BASE_URL}?{urllib.parse.urlencode(params)}"
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    
+
     try:
-        # Use existing aiohttp.ClientSession but enhance headers, cookie handling and error reporting
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15.0)) as session:
-            # Strong macOS Chrome-like headers for homepage visit
-            ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            homepage_headers = {
-                "User-Agent": ua,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Ch-Ua": '"Chromium";v="122", "Google Chrome";v="122", ";Not A Brand";v="99"',
-                "Sec-Ch-Ua-Platform": '"macOS"',
-                "Upgrade-Insecure-Requests": "1",
-                "Referer": "https://www.vinted.de/",
-            }
-
-            # Retry homepage fetch until session cookie appears (max retries)
-            max_retries = 6
-            got_cookie = False
-            for attempt in range(1, max_retries + 1):
-                try:
-                    async with session.get("https://www.vinted.de/", headers=homepage_headers, allow_redirects=True) as home_res:
-                        home_text = await home_res.text()
-                        cookie_snapshot = {c.key: c.value for c in session.cookie_jar}
-                        # New cookie validation: accept modern cookie names returned by Vinted
-                        if any(k in ["access_token_web", "anon_id", "v_udt"] for k in cookie_snapshot.keys()):
-                            got_cookie = True
-                            break
-                except Exception:
-                    # small backoff and retry
-                    await asyncio.sleep(1)
-                    continue
-                await asyncio.sleep(1)
-
-            cookie_snapshot = {c.key: c.value for c in session.cookie_jar}
+            got_cookie = await bootstrap_session(session)
             if not got_cookie:
-                # MUST NOT silently return success; print diagnostic JSON
+                cookie_snapshot = {c.key: c.value for c in session.cookie_jar}
                 print(json.dumps({"success": False, "error": "NO_SESSION_COOKIE", "cookies": list(cookie_snapshot.keys())}), flush=True)
                 return
 
-            # API headers to mimic a real browser fetch for the JSON endpoint
-            api_headers = {
-                "User-Agent": ua,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-site",
-                "Sec-Ch-Ua": '"Chromium";v="122", "Google Chrome";v="122", ";Not A Brand";v="99"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"macOS"',
-                "Referer": "https://www.vinted.de/",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-
-            # Explicit cookie header (session will normally include cookies, but add header to be explicit)
-            cookie_header = "; ".join([f"{k}={v}" for k, v in cookie_snapshot.items()])
-            if cookie_header:
-                api_headers["Cookie"] = cookie_header
-
-            params_api = {"search_text": search_text, "order": "newest_first"}
-            if max_price and max_price > 0:
-                params_api["price_to"] = str(int(max_price))
-
-            try:
-                async with session.get("https://www.vinted.de/api/v2/catalog/items", headers=api_headers, params=params_api) as api_res:
-                    status = api_res.status
-                    text = await api_res.text()
-
-                    if status != 200:
-                        # MUST print raw status and first 500 chars to stdout for debugging WAF
-                        snippet = text[:500].replace("\n", " ")
-                        print(json.dumps({"success": False, "error": "API_HTTP_ERROR", "status": status, "body_snippet": snippet}), flush=True)
-                        return
-
-                    # Parse JSON or report decode failure with response snippet
-                    try:
-                        data = json.loads(text)
-                    except Exception as e_json:
-                        snippet = text[:500].replace("\n", " ")
-                        print(json.dumps({"success": False, "error": "API_JSON_DECODE", "exception": str(e_json), "body_snippet": snippet}), flush=True)
-                        return
-
-                    catalog_items = []
-                    _collect_catalog_items(data, catalog_items)
-
-                    listings = []
-                    for item_data in catalog_items:
-                        item_id = str(item_data.get('id', ''))
-                        if not item_id:
-                            continue
-                        parsed = _parse_json_listing(item_data, item_id, search_text)
-                        if parsed.get("totalPrice") is None:
-                            parsed["totalPrice"] = parsed.get("base_price") or parsed.get("price") or 0.0
-                        if parsed.get("price") is None:
-                            parsed["price"] = parsed.get("base_price") or parsed.get("totalPrice") or 0.0
-                        if parsed.get('price') and float(parsed.get('price')) > 0:
-                            listings.append(parsed)
-
-                    if listings:
-                        if max_price and max_price > 0:
-                            listings = [it for it in listings if it.get('price', 0) > 0 and it['price'] <= max_price]
-                        print(json.dumps({"success": True, "items": listings}), flush=True)
-                        return
-                    else:
-                        # API returned empty data structure - print snippet for debugging
-                        snippet = json.dumps(data)[:500].replace("\n", " ")
-                        print(json.dumps({"success": False, "error": "API_NO_ITEMS", "body_snippet": snippet}), flush=True)
-                        return
-
-            except Exception as e_api:
-                print(json.dumps({"success": False, "error": "API_REQUEST_FAILED", "exception": str(e_api)}), flush=True)
+            result = await fetch_catalog(session, search_text, max_price)
+            if result.get("success"):
+                # Best-effort partial enrichment for the CLI fallback path only — the daemon
+                # path enriches every posted item individually instead (see vinted_daemon.py).
+                api_headers = _build_api_headers(session)
+                await _enrich_seller_ratings(session, api_headers, result["items"])
+                print(json.dumps(result), flush=True)
                 return
 
-            # Fallback: fetch catalog HTML (preserve original behavior but with diagnostic output on failure)
+            # Last-resort fallback: parse the raw catalog HTML page directly.
+            params = {"search_text": search_text, "order": "newest_first"}
+            if max_price and max_price > 0:
+                params["price_to"] = str(int(max_price))
+            url = f"{VINTED_BASE_URL}?{urllib.parse.urlencode(params)}"
             try:
-                async with session.get(url, headers={"User-Agent": ua, "Accept-Language": "de-DE,de;q=0.9,en;q=0.8"}) as page_res:
+                async with session.get(url, headers={"User-Agent": HOMEPAGE_UA, "Accept-Language": "de-DE,de;q=0.9,en;q=0.8"}) as page_res:
                     page_text = await page_res.text()
                     if page_res.status != 200:
                         snippet = page_text[:500].replace("\n", " ")

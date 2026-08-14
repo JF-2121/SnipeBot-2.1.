@@ -9,8 +9,13 @@ export interface ScrapedItem {
   platform: string;
   condition?: string;
   publishedAt?: string;
+  publishedAtTs?: number;
   countryTitle?: string;
   reviewCount?: number;
+  reviewRating?: number;
+  sellerId?: string | number;
+  sellerProfileUrl?: string;
+  sellerCountryCode?: string;
   photos?: string[];
 }
 

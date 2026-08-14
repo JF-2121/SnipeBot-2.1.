@@ -1,11 +1,11 @@
-import { Client, GatewayIntentBits, EmbedBuilder, TextChannel, Events, ActivityType, SlashCommandBuilder, REST, Routes, ButtonBuilder, ButtonStyle, ActionRowBuilder, } from "discord.js";
+import { Client, GatewayIntentBits, EmbedBuilder, TextChannel, Events, ActivityType, SlashCommandBuilder, REST, Routes, ButtonBuilder, ButtonStyle, ActionRowBuilder, AttachmentBuilder, } from "discord.js";
 import axios from "axios";
 import { CATEGORIES } from "./config/categories.js";
-import { BRAND_CHANNELS, getAllBrands } from "./config/brand-channels.js";
+import { CATEGORY_CHANNELS, classifyCategory } from "./config/category-channels.js";
+import { BRAND_CHANNELS, getAllBrands, getRandomizedInterval, } from "./config/brand-channels.js";
 import { logger } from "./lib/logger.js";
-import { vintedScraper } from "./scrapers/vinted.js";
+import { vintedScraper, enrichSeller } from "./scrapers/vinted.js";
 import { kleinanzeigenScraper } from "./scrapers/kleinanzeigen.js";
-const FALLBACK_CHANNEL_ID = "1483482170583678976";
 const DEFAULT_BRANDS = getAllBrands();
 const itemCache = new Map();
 const MAX_CACHE_SIZE = 2000;
@@ -59,6 +59,55 @@ function getCachedItem(identifier) {
     }
     return null;
 }
+const postedMessages = new Map(); // channelId -> messages
+const PURGE_AFTER_MS = 30 * 60 * 1000; // 30 minutes
+const PURGE_SWEEP_INTERVAL_MS = 3 * 60 * 1000; // check every 3 minutes (tighter window needs tighter checks)
+const purgeWarned = new Set();
+function trackPostedMessage(channelId, messageId) {
+    const list = postedMessages.get(channelId) || [];
+    list.push({ id: messageId, postedAt: Date.now() });
+    postedMessages.set(channelId, list);
+}
+async function purgeOldMessages(client) {
+    const now = Date.now();
+    for (const [channelId, messages] of postedMessages.entries()) {
+        const due = messages.filter((m) => now - m.postedAt >= PURGE_AFTER_MS);
+        if (due.length === 0)
+            continue;
+        try {
+            const channel = await client.channels.fetch(channelId).catch(() => null);
+            if (!(channel instanceof TextChannel))
+                continue;
+            const dueIds = due.map((m) => m.id);
+            for (let i = 0; i < dueIds.length; i += 100) {
+                const batch = dueIds.slice(i, i + 100);
+                if (batch.length === 1) {
+                    await channel.messages.delete(batch[0]).catch(() => { });
+                }
+                else {
+                    await channel.bulkDelete(batch, true).catch(() => { });
+                }
+                // small gap between batches to stay well clear of Discord's bulk-delete rate limit
+                await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+            const remaining = messages.filter((m) => now - m.postedAt < PURGE_AFTER_MS);
+            postedMessages.set(channelId, remaining);
+            logger.debug(`🧹 Purged ${due.length} message(s) older than 1h in channel ${channelId}`);
+        }
+        catch (err) {
+            if (!purgeWarned.has(channelId)) {
+                purgeWarned.add(channelId);
+                logger.warn(`⚠️ Auto-purge failed for channel ${channelId} (check bot has "Manage Messages" permission there): ${String(err)}`);
+            }
+        }
+    }
+}
+function startAutoPurge(client) {
+    logger.info(`🧹 Auto-purge active: bot-posted messages are deleted ${PURGE_AFTER_MS / 60000}min after posting (checked every ${PURGE_SWEEP_INTERVAL_MS / 60000}min)`);
+    setInterval(() => {
+        purgeOldMessages(client).catch((err) => logger.error("Purge sweep failed: " + String(err)));
+    }, PURGE_SWEEP_INTERVAL_MS);
+}
 const WHOP_API_KEY = process.env["WHOP_API_KEY"];
 const WHOP_PRODUCT_ID = process.env["WHOP_PRODUCT_ID"];
 const licenseCache = new Map();
@@ -97,10 +146,42 @@ const watchConfig = {
     gender: "beide",
 };
 const seenItemIds = new Set();
-let rateLimitedUntil = 0;
-let consecutiveRateLimits = 0;
-// Global rotation state for round-robin channel distribution per brand
-const brandChannelIndices = {};
+// Global dispatch pacing: ALL 15 brand workers share this single queue, so no matter
+// how many brands find new items at the same moment, actual posts to Discord are
+// serialized at least GLOBAL_DISPATCH_GAP_MS apart system-wide. This is what actually
+// protects us from Discord rate limits/connection bursts — a per-brand-only stagger
+// does nothing to stop 15 independent workers from posting in the same instant.
+// (A single item going to multiple channels for the SAME brand still fans out
+// simultaneously within one slot — only the slots themselves are paced.)
+const GLOBAL_DISPATCH_GAP_MS = 500;
+let dispatchGate = Promise.resolve();
+function nextDispatchSlot() {
+    const mySlot = dispatchGate.then(() => new Promise((resolve) => setTimeout(resolve, GLOBAL_DISPATCH_GAP_MS)));
+    dispatchGate = mySlot;
+    return mySlot;
+}
+/**
+ * Sends to a channel with a couple of short retries. Most failures at this point are
+ * transient connection blips (e.g. undici "Received one or more errors" from a brief
+ * network hiccup), not permanent — retrying once or twice clears the vast majority.
+ */
+async function sendWithRetry(channel, payload, maxRetries = 2) {
+    let lastErr;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await channel.send(payload);
+        }
+        catch (err) {
+            lastErr = err;
+            if (attempt < maxRetries) {
+                const delay = 500 * (attempt + 1);
+                logger.debug(`↻ Retrying send to channel ${channel.id} (attempt ${attempt + 2}/${maxRetries + 1}) after: ${String(err)}`);
+                await new Promise((resolve) => setTimeout(resolve, delay));
+            }
+        }
+    }
+    throw lastErr;
+}
 function runFakeCheck(item) {
     const warnings = [];
     const positives = [];
@@ -153,6 +234,30 @@ function runFakeCheck(item) {
     else {
         positives.push(`👤 Verkäufer: ${item.seller}`);
     }
+    // Real Vinted seller reputation (only available for the freshest few items per search —
+    // see SELLER_RATING_LOOKUP_LIMIT in vinted_helper.py). reviewRating stays undefined/null
+    // when we genuinely don't have the data, vs. a real 0.0 for a confirmed brand-new seller —
+    // don't guess when we don't know.
+    const reviewCount = Number(item.reviewCount ?? 0);
+    const reviewRatingRaw = item.reviewRating;
+    const hasRatingData = reviewRatingRaw !== undefined && reviewRatingRaw !== null;
+    const reviewRating = hasRatingData ? Number(reviewRatingRaw) : undefined;
+    if (hasRatingData) {
+        if (reviewCount === 0) {
+            warnings.push("🆕 Verkäufer hat noch keine Bewertungen auf Vinted");
+            riskScore += 15;
+        }
+        else if (reviewRating < 3.5) {
+            warnings.push(`⭐ Unterdurchschnittliche Verkäufer-Bewertung (${reviewRating.toFixed(1)}★, ${reviewCount} Bewertungen)`);
+            riskScore += 20;
+        }
+        else if (reviewCount >= 20 && reviewRating >= 4.5) {
+            positives.push(`⭐ Vertrauenswürdiger Verkäufer (${reviewRating.toFixed(1)}★, ${reviewCount} Bewertungen)`);
+        }
+        else {
+            positives.push(`⭐ Verkäufer-Bewertung: ${reviewRating.toFixed(1)}★ (${reviewCount} Bewertungen)`);
+        }
+    }
     let verdict;
     let color;
     if (riskScore >= 45) {
@@ -172,7 +277,13 @@ function runFakeCheck(item) {
         .setTitle(`🔍 Fake-Check: ${item.brand || "—"} | ${item.title}`.slice(0, 250))
         .setURL(item.url)
         .setDescription(`**${verdict}**\nRisiko-Score: **${riskScore}/100**`)
-        .addFields({ name: "💰 Preis", value: `${item.price.toFixed(2)} ${item.currency}`, inline: true }, { name: "🏷️ Marke", value: item.brand || "—", inline: true }, { name: "📐 Größe", value: item.size || "—", inline: true }, { name: "✨ Zustand", value: item.condition || "—", inline: true }, { name: "👤 Verkäufer", value: item.seller || "—", inline: true })
+        .addFields({ name: "💰 Preis", value: `${item.price.toFixed(2)} ${item.currency}`, inline: true }, { name: "🏷️ Marke", value: item.brand || "—", inline: true }, { name: "📐 Größe", value: item.size || "—", inline: true }, { name: "✨ Zustand", value: item.condition || "—", inline: true }, {
+        name: "👤 Verkäufer",
+        value: hasRatingData
+            ? `${item.seller || "—"} (${reviewRating.toFixed(1)}★, ${reviewCount} Bewertungen)`
+            : item.seller || "—",
+        inline: true,
+    })
         .setFooter({ text: "Fake-Check • Snipebot" })
         .setTimestamp();
     if (warnings.length > 0)
@@ -182,6 +293,9 @@ function runFakeCheck(item) {
     if (item.imageUrl)
         embed.setThumbnail(item.imageUrl);
     const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🔗 Inserat öffnen").setStyle(ButtonStyle.Link).setURL(item.url));
+    if (item.sellerProfileUrl) {
+        row.addComponents(new ButtonBuilder().setLabel("👤 Verkäuferprofil").setStyle(ButtonStyle.Link).setURL(item.sellerProfileUrl));
+    }
     return { embed, row };
 }
 function ratingToStars(rating, count) {
@@ -189,6 +303,16 @@ function ratingToStars(rating, count) {
     const stars = r > 0 ? "⭐️".repeat(r) : "";
     const cnt = count ?? 0;
     return stars ? `${stars} (${cnt})` : `(0)`;
+}
+/**
+ * Converts a 2-letter ISO country code (e.g. "DE") into its flag emoji via Unicode regional
+ * indicator symbols — pure computation, no lookup table needed.
+ */
+function countryCodeToFlagEmoji(isoCode) {
+    if (!isoCode || isoCode.length !== 2)
+        return "";
+    const codePoints = [...isoCode.toUpperCase()].map((c) => 0x1f1e6 + (c.charCodeAt(0) - 65));
+    return String.fromCodePoint(...codePoints);
 }
 function buildDealEmbed(item) {
     const meta = item;
@@ -199,7 +323,14 @@ function buildDealEmbed(item) {
     const buyerFee = Number(meta.buyerProtectionFee ?? meta.protection_fee ?? 0);
     const totalPrice = Number(meta.totalPrice ?? item.totalPrice ?? (basePrice + buyerFee));
     const reviewsDisplay = ratingToStars(meta.reviewRating, meta.reviewCount);
-    const published = meta.publishedAt || item.publishedAt || "Gerade eben";
+    // Prefer Vinted's real publish timestamp, rendered via Discord's native <t:...> tag —
+    // Discord itself displays this as a live-updating relative time ("5 minutes ago") in the
+    // viewer's own timezone, and shows the exact date/time on hover. Falls back to Kleinanzeigen's
+    // parsed date string (already legitimate), or an honest "—" instead of a fake default.
+    const publishedTs = meta.publishedAtTs ?? item.publishedAtTs;
+    const published = publishedTs
+        ? `<t:${Math.floor(Number(publishedTs))}:R>`
+        : meta.publishedAt || item.publishedAt || "—";
     const sellerName = (meta.sellerUsername || item.sellerUsername || item.seller || "—").toString();
     const sellerAvatar = (meta.sellerAvatar || item.sellerAvatar || "").toString() || undefined;
     const total = Number(totalPrice || 0);
@@ -209,7 +340,7 @@ function buildDealEmbed(item) {
     const mainEmbed = new EmbedBuilder()
         .setColor(0x6EB6FF)
         .setAuthor({ name: sellerName, iconURL: sellerAvatar })
-        .setTitle(`${safeTitle} | ${Number(total || base).toFixed(2)} €`.slice(0, 256))
+        .setTitle(`${countryCodeToFlagEmoji(meta.sellerCountryCode)} ${safeTitle} | ${Number(total || base).toFixed(2)} €`.trim().slice(0, 256))
         .setURL(item.url)
         .addFields({ name: "🏷️ Brand", value: (meta.brand || item.brand || "—") || "—", inline: true }, { name: "📏 Size", value: (meta.size || item.size || "—") || "—", inline: true }, { name: "✨ Condition", value: (meta.condition || item.condition || "—") || "—", inline: true }, { name: "⏰ Published", value: published || "—", inline: true }, { name: "🌟 Reviews", value: reviewsDisplay || "—", inline: true }, { name: "💰 Price", value: priceStr || "—", inline: true })
         .setImage(mainImage)
@@ -219,42 +350,98 @@ function buildDealEmbed(item) {
 }
 function buildDealButtons(item) {
     const itemId = String(item.id || "").trim();
-    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`save_and_check_${itemId}`).setLabel('Merken & Check').setStyle(ButtonStyle.Secondary).setEmoji('💾'), new ButtonBuilder().setCustomId(`interested_${itemId}`).setLabel('Interessiert').setStyle(ButtonStyle.Primary).setEmoji('⚡'));
+    // "Jetzt kaufen" is a Link button (direct one-tap to Vinted) — Discord doesn't allow custom
+    // colors on Link buttons (they're always the same fixed grey/link appearance), only on
+    // interactive buttons, which would cost an extra tap. Direct link wins here.
+    // Secondary is the lightest style Discord offers for "Merken & Check" — there's no true
+    // white-background/black-text option in Discord's component system.
+    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`save_and_check_${itemId}`).setLabel('Merken & Check').setStyle(ButtonStyle.Secondary).setEmoji('💾'), new ButtonBuilder().setLabel('Jetzt kaufen').setStyle(ButtonStyle.Link).setURL(item.url).setEmoji('🛒'));
     return [row];
 }
-async function postDealsForBrand(client, brandConfig) {
+/**
+ * Downloads an image and returns it as a Discord attachment instead of a hotlinked URL.
+ * Once the bytes live on Discord's own CDN there's no external fetch dependency left that
+ * can fail — this is the reliable path vs. embedding raw Vinted CDN URLs directly.
+ */
+async function downloadImageAttachment(url, filename) {
     try {
-        const brandChannelIds = String(brandConfig.channelId || "")
-            .split(",")
-            .map((id) => id.trim())
-            .filter(Boolean);
-        const fetchedChannels = await Promise.all(brandChannelIds.map((id) => client.channels.fetch(id).catch(() => null)));
-        const targetChannels = fetchedChannels.filter((ch) => ch instanceof TextChannel);
-        if (targetChannels.length === 0) {
-            logger.warn(`❌ No valid channels found for brand: ${brandConfig.brand}`);
-            return;
+        const res = await axios.get(url, { responseType: "arraybuffer", timeout: 5000 });
+        return new AttachmentBuilder(Buffer.from(res.data), { name: filename });
+    }
+    catch (err) {
+        logger.debug(`↻ Image download failed for ${filename}, falling back to hotlinked URL: ${String(err)}`);
+        return null;
+    }
+}
+// Category channels (Polos/Pants/Shoes) aggregate items from ALL brand searches instead of
+// running their own — resolved once and cached, same pattern as discord.js's own channel
+// cache, so adding them costs no extra Vinted requests and no extra rate-limit exposure.
+const categoryChannelCache = new Map();
+const categoryChannelWarned = new Set();
+async function resolveCategoryChannel(client, category) {
+    if (categoryChannelCache.has(category))
+        return categoryChannelCache.get(category);
+    const config = CATEGORY_CHANNELS.find((c) => c.category === category);
+    if (!config || !config.channelId || config.channelId.startsWith("REPLACE_WITH_")) {
+        if (!categoryChannelWarned.has(category)) {
+            categoryChannelWarned.add(category);
+            logger.warn(`⚠️ Category channel "${category}" has no valid channel ID configured yet — skipping category routing for it until you provide one.`);
         }
-        logger.info(`📡 Brand ${brandConfig.brand}: SIMULTANEOUS dispatch across all ${targetChannels.length} dedicated channel(s)`);
-        logger.info(`🔍 Searching ${brandConfig.brand}...`);
-        let allItems = await vintedScraper.search(brandConfig.query, {
+        categoryChannelCache.set(category, null);
+        return null;
+    }
+    const channel = await client.channels.fetch(config.channelId).catch(() => null);
+    const resolved = channel instanceof TextChannel ? channel : null;
+    if (!resolved && !categoryChannelWarned.has(category)) {
+        categoryChannelWarned.add(category);
+        logger.warn(`⚠️ Could not resolve category channel "${category}" (id=${config.channelId})`);
+    }
+    categoryChannelCache.set(category, resolved);
+    return resolved;
+}
+async function postDealsForBrand(client, brandConfig) {
+    const brandChannelIds = String(brandConfig.channelId || "")
+        .split(",")
+        .map((id) => id.trim())
+        .filter(Boolean);
+    const fetchedChannels = await Promise.all(brandChannelIds.map((id) => client.channels.fetch(id).catch(() => null)));
+    const targetChannels = fetchedChannels.filter((ch) => ch instanceof TextChannel);
+    if (targetChannels.length === 0) {
+        logger.warn(`❌ No valid channels found for brand: ${brandConfig.brand}`);
+        return;
+    }
+    logger.info(`📡 Brand ${brandConfig.brand}: SIMULTANEOUS dispatch across all ${targetChannels.length} dedicated channel(s)`);
+    logger.info(`🔍 Searching ${brandConfig.brand}...`);
+    let allItems = await vintedScraper.search(brandConfig.query, {
+        maxPrice: watchConfig.maxPrice,
+    });
+    logger.info(`📊 Vinted: ${allItems.length} items for ${brandConfig.brand}`);
+    if (allItems.length === 0) {
+        logger.warn(`⚠️ Vinted returned 0 items for ${brandConfig.brand}, triggering Kleinanzeigen fallback...`);
+        const kleinItems = await kleinanzeigenScraper.search(brandConfig.query, {
             maxPrice: watchConfig.maxPrice,
         });
-        logger.info(`📊 Vinted: ${allItems.length} items for ${brandConfig.brand}`);
-        if (allItems.length === 0) {
-            logger.warn(`⚠️ Vinted returned 0 items for ${brandConfig.brand}, triggering Kleinanzeigen fallback...`);
-            const kleinItems = await kleinanzeigenScraper.search(brandConfig.query, {
-                maxPrice: watchConfig.maxPrice,
-            });
-            logger.info(`📊 Kleinanzeigen fallback: ${kleinItems.length} items for ${brandConfig.brand}`);
-            allItems = kleinItems;
-        }
-        if (allItems.length > 0)
-            consecutiveRateLimits = 0;
-        logger.info(`✅ ${brandConfig.brand}: ${allItems.length} total items`);
-        for (const item of allItems) {
-            const canonicalId = String(item.id || item.link || "").trim();
-            if (!canonicalId || seenItemIds.has(canonicalId))
-                continue;
+        logger.info(`📊 Kleinanzeigen fallback: ${kleinItems.length} items for ${brandConfig.brand}`);
+        allItems = kleinItems;
+    }
+    logger.info(`✅ ${brandConfig.brand}: ${allItems.length} total items`);
+    for (const item of allItems) {
+        const canonicalId = String(item.id || item.link || "").trim();
+        if (!canonicalId || seenItemIds.has(canonicalId))
+            continue;
+        // Mark seen immediately (before the async dispatch below) so a concurrent
+        // worker or a manual /deals suche can never double-post the same item.
+        seenItemIds.add(canonicalId);
+        // Isolated per item: if ONE item fails for any reason (bad data, transient network
+        // error even after retries), it must not block the rest of this brand's items —
+        // otherwise a single hiccup could starve every remaining channel for a whole cycle.
+        try {
+            // Enrich BEFORE building the embed, for every item that reaches this point (i.e. every
+            // item that's actually about to be posted) — not a blind subset of raw search results.
+            // Vinted-only: Kleinanzeigen items have no sellerId/this endpoint.
+            const enrichment = item.platform === "vinted" && item.sellerId
+                ? await enrichSeller(item.sellerId)
+                : null;
             const dealItem = {
                 ...item,
                 id: canonicalId,
@@ -271,69 +458,130 @@ async function postDealsForBrand(client, brandConfig) {
                 totalPrice: Number(item.totalPrice ?? 0),
                 sellerUsername: item.sellerUsername || item.seller || "",
                 sellerAvatar: item.sellerAvatar || "",
-                reviewRating: Number(item.reviewRating ?? item.sellerRating ?? 0),
+                reviewRating: Number(enrichment?.reviewRating ?? item.reviewRating ?? item.sellerRating ?? 0),
+                reviewCount: enrichment?.reviewCount ?? item.reviewCount,
+                sellerCountryCode: enrichment?.sellerCountryCode ?? item.sellerCountryCode,
             };
-            const mainEmbed = buildDealEmbed(dealItem);
+            // Category routing: same item, ALSO fanned out to its matching Polos/Pants/Shoes
+            // channel (if any) in the SAME dispatch event below — not a separate search or a
+            // separate pacing slot, so this adds zero extra Vinted load and zero extra rate-limit risk.
+            const matchedCategory = classifyCategory(dealItem.cleanTitle || dealItem.title);
+            let itemChannels = targetChannels;
+            if (matchedCategory) {
+                const categoryChannel = await resolveCategoryChannel(client, matchedCategory.category);
+                if (categoryChannel && !itemChannels.some((ch) => ch.id === categoryChannel.id)) {
+                    itemChannels = [...itemChannels, categoryChannel];
+                }
+            }
             const images = dealItem.images_array || dealItem.photos || [];
+            const mainImageUrl = images[0] || dealItem.main_image_url || dealItem.imageUrl;
+            const imageUrls = [mainImageUrl, images[1], images[2]].filter((u) => Boolean(u)).slice(0, 3);
+            const filenames = imageUrls.map((_, idx) => `deal_${canonicalId}_${idx}.jpg`);
+            // Download and attach directly instead of hotlinking Vinted's CDN — this removes
+            // Discord's external-image-fetch step (and whatever undocumented limits it hits under
+            // load) as a point of failure entirely. Falls back to the hotlinked URL per-image if a
+            // download fails, rather than dropping the picture.
+            const downloaded = await Promise.all(imageUrls.map((url, idx) => downloadImageAttachment(url, filenames[idx])));
+            const files = downloaded.filter((a) => a !== null);
+            const mainEmbed = buildDealEmbed(dealItem);
+            if (downloaded[0])
+                mainEmbed.setImage(`attachment://${filenames[0]}`);
             const embeds = [mainEmbed];
-            if (images[1])
-                embeds.push(new EmbedBuilder().setURL(dealItem.url).setImage(images[1]));
-            if (images[2])
-                embeds.push(new EmbedBuilder().setURL(dealItem.url).setImage(images[2]));
+            for (let i = 1; i < imageUrls.length; i++) {
+                const extraEmbed = new EmbedBuilder().setURL(dealItem.url);
+                extraEmbed.setImage(downloaded[i] ? `attachment://${filenames[i]}` : imageUrls[i]);
+                embeds.push(extraEmbed);
+            }
             const payload = {
                 embeds,
                 components: buildDealButtons(dealItem),
+                files,
             };
-            // SIMULTANEOUS DISPATCH: Send THIS specific brand's deal to ALL of its configured channels at the same time using Promise.allSettled
-            const dispatchResults = await Promise.allSettled(targetChannels.map(async (channel) => {
-                try {
-                    await channel.send(payload);
-                    logger.debug(`✅ Posted item ${canonicalId} to channel #${channel.name} (${channel.id}) for brand ${brandConfig.brand}`);
-                }
-                catch (err) {
-                    logger.warn(`⚠️ Failed to post to channel ${channel.id}: ${String(err)}`);
-                    throw err;
-                }
+            // Wait for our turn in the global pacing queue (>=500ms since the last dispatch, from ANY brand).
+            await nextDispatchSlot();
+            // SIMULTANEOUS DISPATCH: Send THIS specific item to its brand channel(s) AND its matching
+            // category channel (if any) all at the same time — one dispatch event, one pacing slot.
+            const dispatchResults = await Promise.allSettled(itemChannels.map(async (channel) => {
+                const msg = await sendWithRetry(channel, payload);
+                trackPostedMessage(channel.id, msg.id);
+                logger.debug(`✅ Posted item ${canonicalId} to channel #${channel.name} (${channel.id}) for brand ${brandConfig.brand}`);
+                return msg;
             }));
-            const successCount = dispatchResults.filter(r => r.status === "fulfilled").length;
+            let successCount = 0;
+            dispatchResults.forEach((r, idx) => {
+                if (r.status === "fulfilled") {
+                    successCount++;
+                }
+                else {
+                    logger.warn(`⚠️ Failed to post to channel ${itemChannels[idx].id}: ${String(r.reason)}`);
+                }
+            });
             if (successCount > 0) {
-                seenItemIds.add(canonicalId);
                 cacheItem(dealItem);
-                logger.debug(`✅ Item ${canonicalId} dispatched simultaneously to ${successCount}/${targetChannels.length} channels for brand ${brandConfig.brand}`);
+                logger.debug(`✅ Item ${canonicalId} dispatched simultaneously to ${successCount}/${itemChannels.length} channels for brand ${brandConfig.brand}${matchedCategory ? ` (+ ${matchedCategory.label} category)` : ""}`);
             }
             else {
                 logger.warn(`❌ All dispatches failed for item ${canonicalId}`);
             }
-            // Strict 4-second pacing between items
-            await new Promise((resolve) => setTimeout(resolve, 4000));
         }
-        logger.info(`📌 ${brandConfig.brand}: Processing completed`);
+        catch (err) {
+            logger.warn(`⚠️ Skipped item ${canonicalId} for ${brandConfig.brand} after unexpected error: ${String(err)}`);
+        }
     }
-    catch (err) {
-        logger.error(`❌ Error searching ${brandConfig.brand}: ${String(err)}`);
-    }
+    logger.info(`📌 ${brandConfig.brand}: Processing completed`);
 }
-async function postDeals(client) {
-    if (!watchConfig.active)
-        return;
-    if (Date.now() < rateLimitedUntil) {
-        const waitMinutes = Math.ceil((rateLimitedUntil - Date.now()) / 60000);
-        logger.warn(`⏸️ Rate-limit active - waiting ${waitMinutes} minutes`);
-        return;
+/**
+ * Independent per-brand worker: loops forever (while active) on the brand's OWN
+ * refreshInterval (with jitter), searching and posting to ONLY that brand's channel(s).
+ * All 15 workers run concurrently, so every channel finds and posts its own deals
+ * in real time instead of waiting in a shared sequential queue.
+ */
+async function runBrandWorker(client, brandConfig) {
+    let consecutiveErrors = 0;
+    while (watchConfig.active) {
+        try {
+            await postDealsForBrand(client, brandConfig);
+            consecutiveErrors = 0;
+        }
+        catch (err) {
+            consecutiveErrors++;
+            logger.error(`❌ Worker error for ${brandConfig.brand}: ${String(err)}`);
+        }
+        // Back off a bit longer after repeated failures instead of hammering a broken source.
+        const backoffMultiplier = consecutiveErrors > 0 ? Math.min(consecutiveErrors, 5) : 1;
+        const waitMs = getRandomizedInterval(brandConfig.refreshInterval) * 1000 * backoffMultiplier;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
-    logger.info("🚀 Starting deal search with brand-channel system + Kleinanzeigen fallback");
-    const shuffledBrands = [...BRAND_CHANNELS].sort(() => Math.random() - 0.5);
-    logger.info(`🔀 Randomized brand order: ${shuffledBrands.map(b => b.brand).join(", ")}`);
-    for (const brandConfig of shuffledBrands) {
-        await postDealsForBrand(client, brandConfig);
-        await new Promise(res => setTimeout(res, 2500));
-    }
-    const minSec = 60;
-    const maxSec = 180;
-    const globalDelaySec = Math.floor(Math.random() * (maxSec - minSec + 1)) + minSec;
-    logger.info(`⏱️ Full cycle completed. Next full cycle in ${globalDelaySec}s`);
-    await new Promise(res => setTimeout(res, globalDelaySec * 1000));
-    logger.info("✅ Deal search cycle completed");
+    logger.info(`⏹️ Worker stopped for ${brandConfig.brand}`);
+}
+let workersRunning = false;
+/**
+ * Launches one independent worker per brand. Idempotent — safe to call from
+ * /deals start even if workers are already running.
+ */
+function startAllBrandWorkers(client) {
+    if (workersRunning)
+        return;
+    workersRunning = true;
+    logger.info(`🚀 Launching ${BRAND_CHANNELS.length} parallel brand workers (staggered start, ${GLOBAL_DISPATCH_GAP_MS}ms global pacing) — each brand posts to its own channel(s) as soon as deals are found`);
+    BRAND_CHANNELS.forEach((brandConfig, index) => {
+        // Stagger each worker's FIRST search by GLOBAL_DISPATCH_GAP_MS so all 15 don't hit
+        // Discord's API (channel resolution, then posting) in the same instant at startup.
+        // After this first run, each worker settles into its own independent refreshInterval.
+        setTimeout(() => {
+            runBrandWorker(client, brandConfig).catch((err) => logger.error(`Worker crashed for ${brandConfig.brand}: ${String(err)}`));
+        }, index * GLOBAL_DISPATCH_GAP_MS);
+    });
+}
+/** One-off parallel search across all brands, used by /deals suche (doesn't affect the ongoing workers' schedule). */
+async function runImmediateSearchAllBrands(client) {
+    logger.info("⚡ Manual immediate search across all brands (parallel)");
+    const results = await Promise.allSettled(BRAND_CHANNELS.map((brandConfig) => postDealsForBrand(client, brandConfig)));
+    results.forEach((r, idx) => {
+        if (r.status === "rejected") {
+            logger.error(`❌ Error searching ${BRAND_CHANNELS[idx].brand}: ${String(r.reason)}`);
+        }
+    });
 }
 const commands = [
     new SlashCommandBuilder()
@@ -395,21 +643,9 @@ export async function startBot() {
         catch (err) {
             logger.error("Failed to register slash commands: " + String(err));
         }
-        logger.info("🚀 Starting continuous brand-channel monitoring with Kleinanzeigen fallback...");
-        await postDeals(client);
-        async function continuousMonitoring() {
-            while (watchConfig.active) {
-                try {
-                    await postDeals(client);
-                }
-                catch (err) {
-                    logger.error("Monitoring cycle failed: " + String(err));
-                }
-                const minCycleDelay = 60000;
-                await new Promise(resolve => setTimeout(resolve, minCycleDelay));
-            }
-        }
-        continuousMonitoring().catch((err) => logger.error("Continuous monitoring crashed: " + String(err)));
+        logger.info("🚀 Starting parallel brand-channel monitoring with Kleinanzeigen fallback...");
+        startAllBrandWorkers(client);
+        startAutoPurge(client);
     });
     client.on(Events.InteractionCreate, async (interaction) => {
         if (interaction.isButton()) {
@@ -473,6 +709,29 @@ export async function startBot() {
                 }
                 return;
             }
+            if (customId.startsWith("buy_")) {
+                await interaction.deferReply({ flags: 64 });
+                let item = null;
+                const parts = customId.split("_");
+                const possibleId = parts[parts.length - 1];
+                if (possibleId)
+                    item = getCachedItem(possibleId);
+                if (!item) {
+                    const embedUrl = interaction.message?.embeds?.[0]?.url;
+                    item = findCachedByUrl(embedUrl);
+                }
+                if (!item) {
+                    await interaction.editReply("❌ Item not in cache or expired. Please use a newer deal.");
+                    return;
+                }
+                const platformName = item.platform === "vinted" ? "Vinted" : "Kleinanzeigen";
+                const buyRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel(`🛒 Zu ${platformName}`).setStyle(ButtonStyle.Link).setURL(item.url));
+                await interaction.editReply({
+                    content: `🛒 **${item.brand || ""} | ${item.title}**`.slice(0, 2000),
+                    components: [buyRow],
+                });
+                return;
+            }
             if (customId.startsWith("interested_")) {
                 await interaction.deferUpdate();
                 try {
@@ -506,20 +765,25 @@ export async function startBot() {
                 if (sub === "start") {
                     await cmd.deferReply();
                     watchConfig.active = true;
-                    await cmd.editReply("✅ Deal search started! Searching now...");
-                    await postDeals(client);
+                    startAllBrandWorkers(client);
+                    await cmd.editReply(`✅ Deal search started! ${BRAND_CHANNELS.length} brand workers running in parallel — triggering an immediate search now...`);
+                    await runImmediateSearchAllBrands(client);
                     await cmd.followUp("✅ First search completed!");
                 }
                 else if (sub === "stop") {
                     watchConfig.active = false;
-                    await cmd.reply("⏹️ Deal search stopped.");
+                    workersRunning = false;
+                    await cmd.reply("⏹️ Deal search stopped. All brand workers will wind down after their current cycle.");
                 }
                 else if (sub === "status") {
+                    const trackedMessages = [...postedMessages.values()].reduce((sum, list) => sum + list.length, 0);
                     await cmd.reply(`📊 **Status**\n` +
                         `• Active: ${watchConfig.active ? "✅ Yes" : "❌ No"}\n` +
+                        `• Workers: ${workersRunning ? `✅ ${BRAND_CHANNELS.length} running in parallel` : "❌ Not running"}\n` +
                         `• Brands: ${watchConfig.brands.join(", ")}\n` +
                         `• Max Price: ${watchConfig.maxPrice ? `${watchConfig.maxPrice} EUR` : "no limit"}\n` +
-                        `• Items in cache: ${seenItemIds.size} (${itemCache.size} in memory)`);
+                        `• Items in cache: ${seenItemIds.size} (${itemCache.size} in memory)\n` +
+                        `• Auto-purge: messages older than 1h deleted automatically (${trackedMessages} tracked, pending purge)`);
                 }
                 else if (sub === "marken") {
                     const liste = cmd.options.getString("liste", true);
@@ -545,7 +809,7 @@ export async function startBot() {
                 }
                 else if (sub === "suche") {
                     await cmd.deferReply();
-                    await postDeals(client);
+                    await runImmediateSearchAllBrands(client);
                     await cmd.editReply("✅ Search completed!");
                 }
                 else if (sub === "reset") {
